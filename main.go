@@ -21,11 +21,14 @@ const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 var (
 	// Config variables
-	cfgFile      string
-	clustername  string
-	dummyDataKey string
-	sentinelAddr string
-	tickTime     string
+	cfgFile          string
+	clustername      string
+	dummyDataKey     string
+	sentinelAddr     string
+	tickTime         string
+	entryCount       int
+	entrySize        int
+	skipDataCreation bool
 )
 
 func main() {
@@ -49,12 +52,18 @@ It can also generate dummy data for testing if it doesn't exist.`,
 	rootCmd.Flags().StringVar(&dummyDataKey, "datakey", "dummy-set", "The name of the key to use, where data should be generated if it doesn't already exist")
 	rootCmd.Flags().StringVar(&sentinelAddr, "sentineladdr", "redis-sentinel.service.consul:26379", "The path and port to sentinel services")
 	rootCmd.Flags().StringVar(&tickTime, "ticktime", "100ms", "The tick interval used to hit each replica and issue a scard on the 'datakey'")
+	rootCmd.Flags().IntVar(&entryCount, "entrycount", 8500, "Number of entries to create in the dummy data set")
+	rootCmd.Flags().IntVar(&entrySize, "entrysize", 50000, "Size of each entry in bytes")
+	rootCmd.Flags().BoolVar(&skipDataCreation, "skipdata", false, "Skip data creation even if the key doesn't exist")
 
 	// Bind flags to viper
 	viper.BindPFlag("clustername", rootCmd.Flags().Lookup("clustername"))
 	viper.BindPFlag("datakey", rootCmd.Flags().Lookup("datakey"))
 	viper.BindPFlag("sentineladdr", rootCmd.Flags().Lookup("sentineladdr"))
 	viper.BindPFlag("ticktime", rootCmd.Flags().Lookup("ticktime"))
+	viper.BindPFlag("entrycount", rootCmd.Flags().Lookup("entrycount"))
+	viper.BindPFlag("entrysize", rootCmd.Flags().Lookup("entrysize"))
+	viper.BindPFlag("skipdata", rootCmd.Flags().Lookup("skipdata"))
 
 	// Execute the command
 	if err := rootCmd.Execute(); err != nil {
@@ -97,6 +106,14 @@ func runMonitor() {
 	dummyDataKey := viper.GetString("datakey")
 	sentinelAddr := viper.GetString("sentineladdr")
 	tickTime := viper.GetString("ticktime")
+	entryCount := viper.GetInt("entrycount")
+	entrySize := viper.GetInt("entrysize")
+	skipDataCreation := viper.GetBool("skipdata")
+
+	// Log the data size configuration
+	dataSizeMB := float64(entryCount) * float64(entrySize) / 1024.0 / 1024.0
+	fmt.Printf("Data configuration: %d entries of %d bytes each (~%.2f MB total)\n", 
+		entryCount, entrySize, dataSizeMB)
 
 	// Convert the tickTime to a duration
 	parsedTickTime, err := time.ParseDuration(tickTime)
@@ -117,7 +134,11 @@ func runMonitor() {
 	defer client.Close()
 
 	// Create or verify dummy data
-	ensureDummyDataExists(ctx, client, dummyDataKey)
+	if !skipDataCreation {
+		ensureDummyDataExists(ctx, client, dummyDataKey, entryCount, entrySize)
+	} else {
+		fmt.Println("Skipping data creation as requested")
+	}
 
 	// Create sentinel client to resolve the replicas
 	sentinelClient := redis.NewSentinelClient(&redis.Options{
@@ -132,6 +153,13 @@ func runMonitor() {
 		os.Exit(1)
 	}
 	replicaAddresses := parseReplicaAddrs(replicas, false)
+
+	if len(replicaAddresses) == 0 {
+		fmt.Fprintf(os.Stderr, "no valid replicas found to monitor\n")
+		os.Exit(1)
+	}
+
+	fmt.Printf("Found %d replicas to monitor\n", len(replicaAddresses))
 
 	// Set up error group for monitoring replicas
 	redisClientErrGroup, errGroupCtx := errgroup.WithContext(ctx)
@@ -164,16 +192,18 @@ func createFailoverClient(clustername, sentinelAddr string) *redis.Client {
 	})
 }
 
-func ensureDummyDataExists(ctx context.Context, client *redis.Client, dummyDataKey string) {
+func ensureDummyDataExists(ctx context.Context, client *redis.Client, dummyDataKey string, entryCount, entrySize int) {
 	dummyDataExists := client.Exists(ctx, dummyDataKey)
 	if dummyDataExists.Val() == 0 {
-		fmt.Printf("Creating ~400MB of data in the set, key: %v\n", dummyDataKey)
+		fmt.Printf("Creating data in the set, key: %v\n", dummyDataKey)
 		
 		seededRand := rand.New(rand.NewSource(time.Now().UnixNano()))
+		progressInterval := entryCount / 10 // Show progress every 10%
+		startTime := time.Now()
 		
-		for j := 1; j <= 8_500; j++ {
+		for j := 1; j <= entryCount; j++ {
 			// Generate random string
-			data := stringWithCharset(50_000, charset, seededRand)
+			data := stringWithCharset(entrySize, charset, seededRand)
 			
 			cmd := client.SAdd(ctx, dummyDataKey, data)
 			_, err := cmd.Result()
@@ -181,8 +211,32 @@ func ensureDummyDataExists(ctx context.Context, client *redis.Client, dummyDataK
 				fmt.Fprintf(os.Stderr, "unable to create data in the set %v, err: %v\n", dummyDataKey, err)
 				os.Exit(1)
 			}
+			
+			// Show progress
+			if j%progressInterval == 0 || j == entryCount {
+				progress := float64(j) / float64(entryCount) * 100
+				elapsed := time.Since(startTime)
+				fmt.Printf("Progress: %.1f%% (%d/%d entries, elapsed: %v)\n", 
+					progress, j, entryCount, elapsed.Round(time.Second))
+			}
 		}
-		fmt.Printf("Finished creating data at key: %v\n", dummyDataKey)
+		
+		totalTime := time.Since(startTime)
+		fmt.Printf("Finished creating data at key: %v (took %v)\n", dummyDataKey, totalTime.Round(time.Second))
+		
+		// Get actual size
+		infoMemory, err := client.Info(ctx, "memory").Result()
+		if err == nil {
+			fmt.Printf("Redis memory info after data creation:\n%s\n", infoMemory)
+		}
+	} else {
+		fmt.Printf("Data already exists at key: %v\n", dummyDataKey)
+		
+		// Get the actual set size
+		setSize, err := client.SCard(ctx, dummyDataKey).Result()
+		if err == nil {
+			fmt.Printf("Existing set contains %d entries\n", setSize)
+		}
 	}
 }
 
